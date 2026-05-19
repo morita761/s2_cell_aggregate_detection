@@ -347,6 +347,17 @@ def draw_contour_overlay_color(
 # ─── Debug image saving ───────────────────────────────────────────────────────
 
 
+def _imwrite(path: Path, img: np.ndarray) -> None:
+    """Write an image and print an error if it fails."""
+    try:
+        ok = cv2.imwrite(str(path), img)
+    except Exception as e:
+        print(f"[ERROR] Failed to save debug image {path}: {e}")
+        return
+    if not ok:
+        print(f"[ERROR] cv2.imwrite returned False for {path} — image may be empty or path invalid")
+
+
 def save_debug_images(
     debug_dir: Path,
     prefix: str,
@@ -362,15 +373,15 @@ def save_debug_images(
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     for i, proj in enumerate(channel_projections):
-        cv2.imwrite(str(debug_dir / f"{prefix}_ch{i}_projection.png"), proj)
+        _imwrite(debug_dir / f"{prefix}_ch{i}_projection.png", proj)
 
-    cv2.imwrite(str(debug_dir / f"{prefix}_merge.png"), cv2.cvtColor(merged_rgb, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(debug_dir / f"{prefix}_mask_otsu.png"), mask_otsu)
-    cv2.imwrite(str(debug_dir / f"{prefix}_mask_filled.png"), mask_filled)
-    cv2.imwrite(str(debug_dir / f"{prefix}_mask_final.png"), mask_final)
-    cv2.imwrite(str(debug_dir / f"{prefix}_contour_overlay_gray.png"), overlay_gray)
-    cv2.imwrite(str(debug_dir / f"{prefix}_contour_overlay_color_valid.png"), overlay_color_valid)
-    cv2.imwrite(str(debug_dir / f"{prefix}_contour_overlay_color_rejected.png"), overlay_color_rejected)
+    _imwrite(debug_dir / f"{prefix}_merge.png", cv2.cvtColor(merged_rgb, cv2.COLOR_RGB2BGR))
+    _imwrite(debug_dir / f"{prefix}_mask_otsu.png", mask_otsu)
+    _imwrite(debug_dir / f"{prefix}_mask_filled.png", mask_filled)
+    _imwrite(debug_dir / f"{prefix}_mask_final.png", mask_final)
+    _imwrite(debug_dir / f"{prefix}_contour_overlay_gray.png", overlay_gray)
+    _imwrite(debug_dir / f"{prefix}_contour_overlay_color_valid.png", overlay_color_valid)
+    _imwrite(debug_dir / f"{prefix}_contour_overlay_color_rejected.png", overlay_color_rejected)
 
 
 # ─── Per-field pipeline ───────────────────────────────────────────────────────
