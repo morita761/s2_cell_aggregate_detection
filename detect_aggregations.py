@@ -45,16 +45,11 @@ CHANNEL_COLORS: dict[int, str] = {
 class Config(NamedTuple):
     s2_diameter_um: float = 10.0      # S2 cell diameter in µm (typical 8–12 µm)
     aggregation_min_cells: int = 3    # aggregation threshold = this many S2 cells
-    gaussian_ksize: int = 25          # Gaussian blur kernel size (forced odd)
     morph_close_radius: int = 5       # disk radius for morphology close (pixels)
-    min_active_channels: int = 2           # reject regions with fewer active channels
-    channel_pixel_threshold: float = 10.0  # per-pixel intensity (0–255) to call a pixel "positive"
-    channel_occupancy_fraction: float = 0.3  # minimum channel occupancy as fraction of single S2 cell area
+    binary_threshold: int = 50        # fixed threshold for binarization after median (0–255)
+    min_active_channels: int = 2      # reject regions with fewer active channels
     channel_colors: dict[int, str] = CHANNEL_COLORS
-
-
-def _ensure_odd(k: int) -> int:
-    return k if k % 2 == 1 else k + 1
+    save_debug: bool = False          # save intermediate mask/channel images when True
 
 
 def compute_area_threshold_px(
@@ -66,22 +61,6 @@ def compute_area_threshold_px(
     cell_area_um2 = np.pi * (s2_diameter_um / 2.0) ** 2
     threshold_um2 = cell_area_um2 * min_cells
     return threshold_um2 / (pixel_size_um ** 2)
-
-
-def compute_channel_occupancy_threshold_px(
-    pixel_size_um: float,
-    s2_diameter_um: float,
-    occupancy_fraction: float,
-) -> float:
-    """Minimum positive-pixel count within a component for a channel to be considered active.
-
-    Derived from occupancy_fraction × single-S2-cell area.  Using a fraction
-    rather than the full cell area tolerates expression heterogeneity and
-    partial focal-plane coverage.
-    """
-    single_cell_area_um2 = np.pi * (s2_diameter_um / 2.0) ** 2
-    min_occupancy_um2 = single_cell_area_um2 * occupancy_fraction
-    return min_occupancy_um2 / (pixel_size_um ** 2)
 
 
 # ─── nd2 loading ──────────────────────────────────────────────────────────────
@@ -123,12 +102,20 @@ def iter_fields(
 # ─── Image processing helpers ─────────────────────────────────────────────────
 
 
-def to_uint8(img: np.ndarray) -> np.ndarray:
-    """Min-max normalize to uint8."""
+def to_uint8(
+    img: np.ndarray,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> np.ndarray:
+    """Min-max normalize to uint8, using provided lo/hi if given."""
     img = img.astype(np.float32)
-    lo, hi = float(img.min()), float(img.max())
+    if lo is None:
+        lo = float(img.min())
+    if hi is None:
+        hi = float(img.max())
     if hi > lo:
         img = (img - lo) / (hi - lo) * 255.0
+        img = np.clip(img, 0.0, 255.0)
     else:
         img = np.zeros_like(img)
     return img.astype(np.uint8)
@@ -139,10 +126,35 @@ def max_projection(stack: np.ndarray) -> np.ndarray:
     return stack.max(axis=0)
 
 
+def compute_global_channel_minmax(
+    data: np.ndarray, sizes: dict[str, int]
+) -> list[tuple[float, float]]:
+    """Global (lo, hi) per channel across all fields and Z-planes (raw counts)."""
+    n_channels = sizes.get("C", 1)
+    dim_keys = list(sizes.keys())
+    result: list[tuple[float, float]] = []
+    for ch in range(n_channels):
+        arr = data
+        if "C" in dim_keys:
+            c_axis = dim_keys.index("C")
+            arr = np.take(arr, ch, axis=c_axis)
+        result.append((float(arr.min()), float(arr.max())))
+    return result
+
+
+def compute_median_kernel_size(pixel_size_um: float, s2_diameter_um: float) -> int:
+    """Odd kernel size for median filter: ~1/4 of S2-cell diameter in pixels, minimum 3."""
+    diameter_px = s2_diameter_um / pixel_size_um
+    k = max(3, int(diameter_px / 4))
+    return k if k % 2 == 1 else k + 1
+
+
 def extract_channel_projections(
-    field_data: np.ndarray, sizes: dict[str, int]
+    field_data: np.ndarray,
+    sizes: dict[str, int],
+    global_minmax: list[tuple[float, float]] | None = None,
 ) -> list[np.ndarray]:
-    """Return a list of uint8 MIP images, one per channel."""
+    """Return a list of uint8 MIP images per channel, normalized with global stats."""
     dim_keys = list(sizes.keys())
     n_channels = sizes.get("C", 1)
     projections: list[np.ndarray] = []
@@ -161,9 +173,47 @@ def extract_channel_projections(
             z_axis = remaining.index("Z")
             arr = arr.max(axis=z_axis)
 
-        projections.append(to_uint8(arr))
+        lo, hi = global_minmax[ch] if global_minmax else (None, None)
+        projections.append(to_uint8(arr, lo=lo, hi=hi))
 
     return projections
+
+
+def extract_center_slices(
+    field_data: np.ndarray,
+    sizes: dict[str, int],
+    pixel_size_um: float,
+    s2_diameter_um: float,
+    global_minmax: list[tuple[float, float]] | None = None,
+) -> list[np.ndarray]:
+    """Center Z-slice per channel with adaptive median filter for channel activity detection."""
+    dim_keys = list(sizes.keys())
+    n_channels = sizes.get("C", 1)
+    n_z = sizes.get("Z", 1)
+    center_z = n_z // 2
+    kernel_size = compute_median_kernel_size(pixel_size_um, s2_diameter_um)
+    slices: list[np.ndarray] = []
+
+    for ch in range(n_channels):
+        arr = field_data
+
+        if "C" in dim_keys:
+            c_axis = dim_keys.index("C")
+            arr = np.take(arr, ch, axis=c_axis)
+            remaining = [k for k in dim_keys if k != "C"]
+        else:
+            remaining = list(dim_keys)
+
+        if "Z" in remaining:
+            z_axis = remaining.index("Z")
+            arr = np.take(arr, center_z, axis=z_axis)
+
+        lo, hi = global_minmax[ch] if global_minmax else (None, None)
+        normalized = to_uint8(arr, lo=lo, hi=hi)
+        filtered = cv2.medianBlur(normalized, kernel_size)
+        slices.append(filtered)
+
+    return slices
 
 
 def merge_channels(channel_projections: list[np.ndarray]) -> np.ndarray:
@@ -197,34 +247,30 @@ def segment_occupancy(
     img: np.ndarray, cfg: Config
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Cell occupancy estimation pipeline.
+    Cell occupancy estimation pipeline.  Expects a pre-filtered (median) image.
 
     Steps
     -----
-    1. Gaussian blur   — suppress shot noise and point-like membrane fluorescence
-    2. Otsu threshold  — global, data-driven binarization
-    3. binary_fill_holes — fill dark nuclei so donut → disk
-    4. morphology close  — bridge sub-pixel gaps without merging distant cells
+    1. Fixed threshold — binarize with cfg.binary_threshold
+    2. binary_fill_holes — fill dark nuclei so donut → disk
+    3. morphology close  — bridge sub-pixel gaps without merging distant cells
 
     Returns
     -------
-    mask_otsu   : uint8 binary after Otsu
+    mask_binary : uint8 binary after fixed threshold
     mask_filled : uint8 binary after hole filling
     mask_final  : uint8 binary after morphology close (used for detection)
     """
-    gk = _ensure_odd(cfg.gaussian_ksize)
-    blurred = cv2.GaussianBlur(img, (gk, gk), 0)
-
-    _, mask_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask_binary = cv2.threshold(img, cfg.binary_threshold, 255, cv2.THRESH_BINARY)
 
     # Fill enclosed dark regions (e.g. nucleus inside membrane ring)
-    mask_filled = binary_fill_holes(mask_otsu > 0).astype(np.uint8) * 255
+    mask_filled = binary_fill_holes(mask_binary > 0).astype(np.uint8) * 255
 
     r = cfg.morph_close_radius
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     mask_final = cv2.morphologyEx(mask_filled, cv2.MORPH_CLOSE, kernel)
 
-    return mask_otsu, mask_filled, mask_final
+    return mask_binary, mask_filled, mask_final
 
 
 # ─── Connected components & area filtering ────────────────────────────────────
@@ -240,39 +286,34 @@ class RegionRecord(NamedTuple):
 
 def count_active_channels(
     component_mask: np.ndarray,
-    channel_projections: list[np.ndarray],
-    pixel_threshold: float,
-    min_occupancy_px: float,
+    binary_center_slices: list[np.ndarray],
 ) -> int:
-    """Count channels with biologically meaningful occupancy within the component.
+    """Count channels that have any positive pixel within the component.
 
-    A channel is active when the number of positive pixels (intensity > pixel_threshold)
-    inside the component reaches min_occupancy_px.  This rejects hot pixels and
-    sub-cellular noise that would pass a pure intensity test.
+    Each center slice must already be binarized (values 0 or 255).
+    A channel is active when at least one white pixel overlaps the component.
     """
     return sum(
-        1 for ch in channel_projections
-        if int(((ch > pixel_threshold) & component_mask).sum()) >= min_occupancy_px
+        1 for slc in binary_center_slices
+        if (slc.astype(bool) & component_mask).any()
     )
 
 
 def detect_aggregations(
     mask: np.ndarray,
-    channel_projections: list[np.ndarray],
+    binary_center_slices: list[np.ndarray],
     pixel_size_um: float,
     field_id: int,
     area_threshold_px: float,
     min_active_channels: int,
-    channel_pixel_threshold: float,
-    min_channel_occupancy_px: float,
 ) -> tuple[list[RegionRecord], np.ndarray, np.ndarray]:
     """
-    Label connected components; filter by area then by active-channel occupancy.
+    Label connected components; filter by area then by active-channel check.
 
     A region is accepted only when:
       area_px >= area_threshold_px
       AND active_channels >= min_active_channels
-      where active = positive-pixel count inside component >= min_channel_occupancy_px
+      where active = any white pixel inside component in the binarized center slice
 
     Returns
     -------
@@ -294,10 +335,7 @@ def detect_aggregations(
             continue
 
         component_mask = labeled == label_id
-        active_ch = count_active_channels(
-            component_mask, channel_projections,
-            channel_pixel_threshold, min_channel_occupancy_px,
-        )
+        active_ch = count_active_channels(component_mask, binary_center_slices)
 
         if active_ch >= min_active_channels:
             valid_mask[component_mask] = 255
@@ -362,26 +400,37 @@ def save_debug_images(
     debug_dir: Path,
     prefix: str,
     channel_projections: list[np.ndarray],
+    center_slices: list[np.ndarray],
+    binary_center_slices: list[np.ndarray],
     merged_rgb: np.ndarray,
-    mask_otsu: np.ndarray,
+    gray_merged_median: np.ndarray,
+    mask_binary: np.ndarray,
     mask_filled: np.ndarray,
     mask_final: np.ndarray,
     overlay_gray: np.ndarray,
     overlay_color_valid: np.ndarray,
     overlay_color_rejected: np.ndarray,
+    save_debug: bool = False,
 ) -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, proj in enumerate(channel_projections):
-        _imwrite(debug_dir / f"{prefix}_ch{i}_projection.png", proj)
+    # Always saved
+    _imwrite(debug_dir / f"{prefix}_color_merge.png", cv2.cvtColor(merged_rgb, cv2.COLOR_RGB2BGR))
+    _imwrite(debug_dir / f"{prefix}_overlay_valid.png", overlay_color_valid)
+    _imwrite(debug_dir / f"{prefix}_overlay_rejected.png", overlay_color_rejected)
 
-    _imwrite(debug_dir / f"{prefix}_merge.png", cv2.cvtColor(merged_rgb, cv2.COLOR_RGB2BGR))
-    _imwrite(debug_dir / f"{prefix}_mask_otsu.png", mask_otsu)
-    _imwrite(debug_dir / f"{prefix}_mask_filled.png", mask_filled)
-    _imwrite(debug_dir / f"{prefix}_mask_final.png", mask_final)
-    _imwrite(debug_dir / f"{prefix}_contour_overlay_gray.png", overlay_gray)
-    _imwrite(debug_dir / f"{prefix}_contour_overlay_color_valid.png", overlay_color_valid)
-    _imwrite(debug_dir / f"{prefix}_contour_overlay_color_rejected.png", overlay_color_rejected)
+    if save_debug:
+        for i, proj in enumerate(channel_projections):
+            _imwrite(debug_dir / f"{prefix}_ch{i}_mip.png", proj)
+        for i, slc in enumerate(center_slices):
+            _imwrite(debug_dir / f"{prefix}_ch{i}_center_median.png", slc)
+        for i, slc in enumerate(binary_center_slices):
+            _imwrite(debug_dir / f"{prefix}_ch{i}_center_binary.png", slc)
+        _imwrite(debug_dir / f"{prefix}_mip_merged_median.png", gray_merged_median)
+        _imwrite(debug_dir / f"{prefix}_binary_thresh.png", mask_binary)
+        _imwrite(debug_dir / f"{prefix}_binary_filled.png", mask_filled)
+        _imwrite(debug_dir / f"{prefix}_binary_closed.png", mask_final)
+        _imwrite(debug_dir / f"{prefix}_overlay_gray.png", overlay_gray)
 
 
 # ─── Per-field pipeline ───────────────────────────────────────────────────────
@@ -394,38 +443,54 @@ def process_field(
     field_id: int,
     cfg: Config,
     debug_dir: Path,
+    global_minmax: list[tuple[float, float]] | None = None,
 ) -> list[RegionRecord]:
     """Full occupancy-based pipeline for one field of view."""
-    channel_projections = extract_channel_projections(field_data, field_sizes)
+    median_k = compute_median_kernel_size(pixel_size_um, cfg.s2_diameter_um)
+    channel_projections = extract_channel_projections(field_data, field_sizes, global_minmax)
+    center_slices = extract_center_slices(
+        field_data, field_sizes, pixel_size_um, cfg.s2_diameter_um, global_minmax
+    )
     gray_merged = merge_channels(channel_projections)
+    gray_merged_median = cv2.medianBlur(gray_merged, median_k)
     rgb_merged = pseudo_color_merge(channel_projections, cfg.channel_colors)
 
-    mask_otsu, mask_filled, mask_final = segment_occupancy(gray_merged, cfg)
+    if field_id == 0:
+        pct5 = int(np.percentile(gray_merged_median, 5))
+        pct95 = int(np.percentile(gray_merged_median, 95))
+        print(
+            f"  [field 0 merged_median] dtype={gray_merged_median.dtype}"
+            f"  range=[{gray_merged_median.min()}, {gray_merged_median.max()}]"
+            f"  5th–95th pct=[{pct5}, {pct95}]"
+        )
+
+    mask_binary, mask_filled, mask_final = segment_occupancy(gray_merged_median, cfg)
+
+    binary_center_slices = [
+        cv2.threshold(slc, cfg.binary_threshold, 255, cv2.THRESH_BINARY)[1]
+        for slc in center_slices
+    ]
 
     area_threshold_px = compute_area_threshold_px(
         pixel_size_um, cfg.s2_diameter_um, cfg.aggregation_min_cells
     )
 
-    min_channel_occupancy_px = compute_channel_occupancy_threshold_px(
-        pixel_size_um, cfg.s2_diameter_um, cfg.channel_occupancy_fraction,
-    )
-
     records, valid_mask, rejected_mask = detect_aggregations(
-        mask_final, channel_projections, pixel_size_um, field_id,
+        mask_final, binary_center_slices, pixel_size_um, field_id,
         area_threshold_px, cfg.min_active_channels,
-        cfg.channel_pixel_threshold, min_channel_occupancy_px,
     )
 
-    overlay_gray = draw_contour_overlay_gray(gray_merged, valid_mask, rejected_mask)
+    overlay_gray = draw_contour_overlay_gray(gray_merged_median, valid_mask, rejected_mask)
     # (0, 0, 255) = red in BGR;  (255, 0, 0) = blue in BGR
     overlay_color_valid = draw_contour_overlay_color(rgb_merged, valid_mask, (0, 0, 255))
     overlay_color_rejected = draw_contour_overlay_color(rgb_merged, rejected_mask, (255, 0, 0))
 
     prefix = f"field{field_id:02d}"
     save_debug_images(
-        debug_dir, prefix, channel_projections, rgb_merged,
-        mask_otsu, mask_filled, mask_final, overlay_gray,
-        overlay_color_valid, overlay_color_rejected,
+        debug_dir, prefix, channel_projections, center_slices, binary_center_slices,
+        rgb_merged, gray_merged_median, mask_binary, mask_filled, mask_final,
+        overlay_gray, overlay_color_valid, overlay_color_rejected,
+        save_debug=cfg.save_debug,
     )
 
     n_rejected = len(_contours_from_mask(rejected_mask))
@@ -471,10 +536,17 @@ def process_nd2(nd2_path: Path, output_dir: Path, cfg: Config) -> None:
     debug_dir = output_dir / "debug" / nd2_path.stem
     all_records: list[RegionRecord] = []
 
+    global_minmax = compute_global_channel_minmax(data, sizes)
+    print(f"  Global per-channel range: {[(f'{lo:.0f}', f'{hi:.0f}') for lo, hi in global_minmax]}")
+
+    median_k = compute_median_kernel_size(pixel_size_um, cfg.s2_diameter_um)
+    print(f"  Median filter kernel: {median_k}px  ({cfg.s2_diameter_um}µm / {pixel_size_um:.4f}µm/px ÷ 4)")
+    print(f"  Binary threshold    : {cfg.binary_threshold}  (pass --binary-threshold N to change)")
+
     for field_id, field_data, field_sizes in iter_fields(data, sizes):
         records = process_field(
             field_data, field_sizes, pixel_size_um,
-            field_id, cfg, debug_dir,
+            field_id, cfg, debug_dir, global_minmax,
         )
         all_records.extend(records)
 
@@ -492,33 +564,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("nd2_path", type=Path, help="Input .nd2 file")
     p.add_argument("output_dir", type=Path, help="Directory for CSV and debug images")
+    _d = Config()  # single source of truth for all defaults
     p.add_argument(
-        "--s2-diameter", type=float, default=10.0,
+        "--s2-diameter", type=float, default=_d.s2_diameter_um,
         help="S2 cell diameter in µm (used to compute aggregation area threshold)",
     )
     p.add_argument(
-        "--min-cells", type=int, default=3,
+        "--min-cells", type=int, default=_d.aggregation_min_cells,
         help="Minimum number of S2 cells to call a region an aggregation",
     )
     p.add_argument(
-        "--gaussian-ksize", type=int, default=25,
-        help="Gaussian blur kernel size (forced to odd)",
-    )
-    p.add_argument(
-        "--morph-close-radius", type=int, default=5,
+        "--morph-close-radius", type=int, default=_d.morph_close_radius,
         help="Disk radius (pixels) for morphology close after hole filling",
     )
     p.add_argument(
-        "--min-active-channels", type=int, default=2,
-        help="Minimum number of fluorescence channels active within a region to accept it",
+        "--binary-threshold", type=int, default=_d.binary_threshold,
+        help="Fixed intensity threshold (0–255) for binarization after median filter",
     )
     p.add_argument(
-        "--channel-pixel-threshold", type=float, default=10.0,
-        help="Per-pixel intensity (0–255) above which a pixel counts as positive for a channel",
+        "--min-active-channels", type=int, default=_d.min_active_channels,
+        help="Minimum number of channels that must have a positive pixel in the component",
     )
     p.add_argument(
-        "--channel-occupancy-fraction", type=float, default=0.3,
-        help="Fraction of single-S2-cell area a channel must occupy to be considered active",
+        "--debug", action="store_true",
+        help="Save all intermediate images (per-channel MIPs, center slices, mask stages)",
     )
     return p
 
@@ -530,11 +599,10 @@ def main() -> None:
     cfg = Config(
         s2_diameter_um=args.s2_diameter,
         aggregation_min_cells=args.min_cells,
-        gaussian_ksize=args.gaussian_ksize,
         morph_close_radius=args.morph_close_radius,
+        binary_threshold=args.binary_threshold,
         min_active_channels=args.min_active_channels,
-        channel_pixel_threshold=args.channel_pixel_threshold,
-        channel_occupancy_fraction=args.channel_occupancy_fraction,
+        save_debug=args.debug,
     )
     process_nd2(args.nd2_path, args.output_dir, cfg)
 
