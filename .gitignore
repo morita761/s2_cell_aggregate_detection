@@ -1,4 +1,7 @@
 venv/
-debug/
-output/
+debug*/
+output*/
 *.nd2
+# Pythonのキャッシュフォルダとファイルを一括除外
+__pycache__/
+*.pyc
